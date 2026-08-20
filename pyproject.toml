@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "f1-tire-model"
+version = "0.1.0"
+description = "Physics-informed F1 tire degradation modeling pipeline (ML-ready architecture)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Ryu" }]
+
+dependencies = [
+    "fastf1>=3.3",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+    "pyarrow>=14.0",       # parquet I/O
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov",
+    "black",
+    "ruff",
+    "ipykernel",           # so notebooks can use the installed package's kernel
+]
+ml = [
+    # installed later, in the ML phase of the project — kept separate so
+    # the core pipeline never depends on heavy ML libraries
+    "scikit-learn>=1.3",
+    "torch",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

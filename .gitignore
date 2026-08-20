@@ -1,0 +1,18 @@
+﻿# virtual environment
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# FastF1 telemetry cache (raw API cache, not your processed dataset)
+data_cache/
+
+# build artifacts
+*.egg-info/
+build/
+dist/
+
+# env files
+.env
