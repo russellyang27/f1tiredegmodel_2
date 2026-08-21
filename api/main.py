@@ -1,30 +1,22 @@
 """
 FastAPI wrapper around the real Random Forest tire-degradation model.
 
+Loads an ALREADY-FITTED model + precomputed defaults from disk (see
+scripts/export_model.py) rather than fitting from raw data on every cold
+boot -- see get_model_and_defaults() below for why that changed.
+
 Verified against the actual project source you provided
 (f1_tire_model.models.random_forest, f1_tire_model.models.tire_report,
-f1_tire_model.models.tire_life) -- the signatures and logic below are
-written directly against that source, not guesswork, with two exceptions
-flagged below.
+f1_tire_model.models.tire_life, f1_tire_model.datasets.storage) -- the
+prediction logic mirrors generate_tire_report()'s exact precedence rules
+(circuit+compound-specific defaults, explicit request values always
+override those defaults, is_raining injected the same way
+generate_tire_report injects extra_covariates), just computed once ahead
+of time via scripts/export_model.py instead of live per-request.
 
-Design note: generate_tire_report() / TireLifeEstimator are your validated
-"one number" report layer (a single life-estimate per compound, with
-fractional-lap interpolation). This endpoint needs the FULL per-age curve
-for the frontend chart, which that report layer doesn't expose -- so this
-does its own single age-sweep per compound instead of calling
-generate_tire_report(), but deliberately mirrors its exact precedence
-rules (default_covariates() for circuit+compound-specific defaults,
-explicit request values always override those defaults, is_raining
-injected the same way generate_tire_report injects extra_covariates) so
-this endpoint's numbers should match what generate_tire_report would say
-for the same inputs.
-
-Confirmed against your actual source for all four modules this touches
-(random_forest.py, tire_report.py, tire_life.py, and now storage.py) --
-nothing below is guesswork anymore except your final deployed domain.
-
-Run it:
-    pip install fastapi "uvicorn[standard]" --break-system-packages
+Run it locally:
+    pip install -r api/requirements.txt
+    python scripts/export_model.py   # from your project root, once
     uvicorn api.main:app --reload --port 8000
 
 Then point the frontend at it:
@@ -35,8 +27,10 @@ Then point the frontend at it:
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
+import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -44,17 +38,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from f1_tire_model.config import DEFAULT_SETTINGS
-from f1_tire_model.datasets.storage import load_dataset
-from f1_tire_model.models.random_forest import (
-    DEFAULT_CONTINUOUS_FEATURES,
-    RandomForestTireDegradationModel,
-)
-from f1_tire_model.models.tire_report import default_covariates
+from f1_tire_model.models.random_forest import RandomForestTireDegradationModel  # noqa: F401 -- needed so joblib can unpickle the model class
 
 MAX_AGE_LAPS = 40
-DRIVER_FEATURES = ("avg_braking_decel_ms2", "peak_braking_decel_ms2", "avg_throttle_pct")
 
 CompoundId = Literal["SOFT", "MEDIUM", "HARD"]
+
+ARTIFACT_DIR = Path(__file__).parent
+MODEL_PATH = ARTIFACT_DIR / "model.joblib"
+DEFAULTS_PATH = ARTIFACT_DIR / "defaults.joblib"
 
 
 # ---------------------------------------------------------------------------
@@ -92,38 +84,26 @@ class PredictionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Model loading -- fit once at process startup, cache in memory. Matches the
-# validated production config from random_forest.py's own module docstring:
-# fuel_load_estimate_kg excluded (age-inconsistency bug), driver-behavior
-# features included, fit on all data (no held-out split here -- evaluation
-# happens separately/offline per your project's own workflow).
+# Model loading -- loads an ALREADY-FITTED model + precomputed defaults from
+# disk (see scripts/export_model.py), rather than refitting from raw parquet
+# data on every cold boot. That refit-on-boot approach worked locally but was
+# far too slow on a free-tier host's single shared vCPU -- slow enough that
+# requests silently exceeded even a 50s client timeout with no server error
+# at all (uvicorn only logs a request line after it finishes responding, so
+# a stuck fit() produces zero log evidence, which is what made this tricky
+# to diagnose). Loading a pre-fitted model is near-instant by comparison.
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
-def get_model_and_data() -> tuple[RandomForestTireDegradationModel, pd.DataFrame]:
-    df = load_dataset()  # defaults to Settings.dataset_output_dir -- confirmed correct against your real storage.py
-
-    if df.empty:
-        # load_dataset() returns an empty frame rather than raising when no
-        # .parquet fragments exist (see its own docstring) -- almost always
-        # means the dataset directory wasn't included in this deployment.
-        # Fail loudly here instead of letting sklearn raise a confusing
-        # error several calls deeper.
+def get_model_and_defaults() -> tuple[RandomForestTireDegradationModel, dict]:
+    if not MODEL_PATH.exists() or not DEFAULTS_PATH.exists():
         raise RuntimeError(
-            "load_dataset() returned no rows -- no .parquet fragments found in "
-            "Settings.dataset_output_dir. Make sure the built dataset directory is "
-            "actually present in this deployment (it won't be included automatically "
-            "by a typical git-based deploy unless committed or fetched at build time)."
+            f"{MODEL_PATH.name} / {DEFAULTS_PATH.name} not found in {ARTIFACT_DIR}. "
+            "Run scripts/export_model.py locally (where your real dataset lives) and "
+            "commit the two output files into this repo's api/ folder."
         )
-
-    continuous_no_fuel = tuple(f for f in DEFAULT_CONTINUOUS_FEATURES if f != "fuel_load_estimate_kg")
-    model = RandomForestTireDegradationModel(
-        continuous_features=continuous_no_fuel + DRIVER_FEATURES,
-        n_estimators=200,
-        max_depth=10,
-        min_samples_leaf=5,
-    ).fit(df)
-
-    return model, df
+    model = joblib.load(MODEL_PATH)
+    lookup = joblib.load(DEFAULTS_PATH)  # {"circuits": [...], "defaults": {circuit: {compound: {...}}}}
+    return model, lookup
 
 
 app = FastAPI(title="F1 Tire Degradation Model API")
@@ -153,9 +133,9 @@ def health():
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict(req: PredictionRequest) -> PredictionResponse:
-    model, df = get_model_and_data()
+    model, lookup = get_model_and_defaults()
 
-    if req.circuit not in df["circuit"].unique():
+    if req.circuit not in lookup["circuits"]:
         raise HTTPException(
             status_code=400,
             detail=f"Circuit '{req.circuit}' was not seen in training -- this model can only "
@@ -166,12 +146,11 @@ def predict(req: PredictionRequest) -> PredictionResponse:
     results: list[CompoundResult] = []
 
     for compound in req.compounds:
-        # Circuit+compound-specific defaults for whatever the model needs
-        # beyond track_temp_c/circuit/compound/age (driver-behavior
-        # features) -- see default_covariates()'s own docstring for why
-        # this is restricted to circuit+compound rather than blended
-        # across all compounds (the same class of bug as fuel load).
-        covariates = default_covariates(df, model, circuit=req.circuit, compound=compound)
+        # Precomputed circuit+compound-specific defaults (see
+        # scripts/export_model.py) -- same values default_covariates()
+        # would compute live, just done once at export time instead of on
+        # every request.
+        covariates = dict(lookup["defaults"][req.circuit][compound])
 
         # Explicit request values always win over the auto-computed
         # defaults above -- same precedence generate_tire_report() uses
