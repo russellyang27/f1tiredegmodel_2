@@ -62,12 +62,32 @@ def main() -> None:
         for compound in COMPOUNDS:
             defaults[circuit][compound] = default_covariates(df, model, circuit=circuit, compound=compound)
 
+    # Real ceiling per circuit -- trees can't extrapolate past the range of
+    # values they were trained on; beyond the max tire_age_laps a circuit
+    # actually saw, the model just repeats whatever its last real split
+    # decided, forever. That flat tail can still have a healthy sample count
+    # in extrapolation_mask()'s leaf-based check (since it doesn't
+    # distinguish "many laps at age 44" from "zero laps at age 60 landing
+    # in the same terminal leaf"), so age-ceiling needs its own explicit
+    # guard rather than relying on that check alone. Capping the sweep here
+    # keeps every reported "durable" result grounded in real observed data,
+    # instead of quietly running the sweep into fabricated territory.
+    max_age_by_circuit: dict[str, int] = (
+        df.groupby("circuit")["tire_age_laps"].max().astype(int).to_dict()
+    )
+
     OUTPUT_DIR.mkdir(exist_ok=True)
     joblib.dump(model, OUTPUT_DIR / "model.joblib")
-    joblib.dump({"circuits": circuits, "defaults": defaults}, OUTPUT_DIR / "defaults.joblib")
+    joblib.dump(
+        {"circuits": circuits, "defaults": defaults, "max_age_by_circuit": max_age_by_circuit},
+        OUTPUT_DIR / "defaults.joblib",
+    )
 
     print(f"Wrote {OUTPUT_DIR / 'model.joblib'} and {OUTPUT_DIR / 'defaults.joblib'}")
     print(f"Covers {len(circuits)} circuits: {', '.join(circuits)}")
+    print("Max real tire_age_laps observed per circuit (sweep ceiling):")
+    for circuit in circuits:
+        print(f"  {circuit}: {max_age_by_circuit[circuit]}")
 
 
 if __name__ == "__main__":
