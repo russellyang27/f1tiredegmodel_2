@@ -40,7 +40,9 @@ from pydantic import BaseModel, Field
 from f1_tire_model.config import DEFAULT_SETTINGS
 from f1_tire_model.models.random_forest import RandomForestTireDegradationModel  # noqa: F401 -- needed so joblib can unpickle the model class
 
-MAX_AGE_LAPS = 40
+MAX_AGE_LAPS = 60  # matches TireLifeEstimator's own default max_age_laps (tire_life.py) -- 40 was an
+                    # arbitrary earlier choice with no basis in the real project, and was cutting real
+                    # circuits' predicted curves off before they'd actually crossed a given threshold.
 
 CompoundId = Literal["SOFT", "MEDIUM", "HARD"]
 
